@@ -11,7 +11,7 @@ st.set_page_config(
 
 # --- 2. ข้อมูลรหัสผ่านของระบบหลังบ้าน ---
 USER_CREDENTIALS = {
-    "admin1": "rmutto123",
+    "monthira": "m123456",
     "registry_staff": "rmutto456",
 }
 
