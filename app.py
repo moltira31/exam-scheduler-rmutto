@@ -12,7 +12,7 @@ st.set_page_config(
     layout="wide",
 )
 
-USER_CREDENTIALS = {"admin1": "rmutto123", "registry_staff": "rmutto456"}
+USER_CREDENTIALS = {"monthira": "123456", "registry_staff": "rmutto456"}
 
 # --- Session State สำหรับล็อกอินและจดจำตารางสอบเดิม ---
 if "logged_in" not in st.session_state:
