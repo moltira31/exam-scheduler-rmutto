@@ -1,25 +1,28 @@
+import datetime
 import io
+import openpyxl
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 import pandas as pd
 import streamlit as st
 
-# --- 1. ตั้งค่าหน้าจอของโปรแกรมเบื้องต้น ---
+# ==================== 1. ตั้งค่าหน้าจอโปรแกรม ====================
 st.set_page_config(
     page_title="ระบบจัดตารางสอบ - มทร.ตะวันออก วิทยาเขตจันทบุรี",
     page_icon="🏫",
     layout="wide",
 )
 
-# --- 2. ข้อมูลรหัสผ่านของระบบหลังบ้าน (Database จำลอง) ---
-USER_CREDENTIALS = {
-   "monthira": "12345",  # รหัสผ่านแอดมิน 1
-    "registry_staff": "rmutto456",  # รหัสผ่านเจ้าหน้าที่ทะเบียน
-}
+USER_CREDENTIALS = {"admin1": "rmutto123", "registry_staff": "rmutto456"}
 
-# --- 3. จัดการสถานะการเข้าระบบ (Session State) ---
+# --- Session State สำหรับล็อกอินและจดจำตารางสอบเดิม ---
 if "logged_in" not in st.session_state:
     st.session_state["logged_in"] = False
 if "username" not in st.session_state:
     st.session_state["username"] = ""
+
+# ความจำตารางสอบสะสม (Memory across multiple uploads in same semester)
+if "history_schedule" not in st.session_state:
+    st.session_state["history_schedule"] = pd.DataFrame()
 
 
 def logout():
@@ -28,68 +31,212 @@ def logout():
     st.rerun()
 
 
-# --- 4. ฟังก์ชันสร้างไฟล์ Excel ตัวอย่างให้ผู้ใช้ดาวน์โหลด ---
-def create_dummy_subject_excel():
-    data = {
-        "รหัสวิชา": [
-            "05-110-104",
-            "05-110-104",
-            "02-303-101",
-            "02-303-102",
-        ],
-        "ชื่อวิชา": [
-            "ภาษาอังกฤษทั่วไป",
-            "ภาษาอังกฤษทั่วไป",
-            "การวิเคราะห์และออกแบบระบบ",
-            "การเขียนโปรแกรมคอมพิวเตอร์",
-        ],
-        "กลุ่มเรียน": ["IS-261", "BA-21", "IS-261", "IT-11"],
-        "จำนวนผู้เข้าสอบ": [35, 38, 35, 40],
-        "ชื่อผู้สอน": [
-            "อ.มาริสา คงดี",
-            "อ.สมชาย ใจดี",
-            "ดร.สมชาย ใจดี",
-            "อ.สมศรี รักเรียน",
-        ],
-        "สังกัดสาขา": [
-            "ภาษาศาสตร์",
-            "ภาษาศาสตร์",
-            "เทคโนโลยีสารสนเทศ",
-            "เทคโนโลยีสารสนเทศ",
-        ],
-        "ประเภทการสอบ": [
-            "ทฤษฎี",
-            "ทฤษฎี",
-            "ทฤษฎี",
-            "ปฏิบัติคอมพิวเตอร์",
-        ],
-        "ชั่วโมงสอบ (นาที)": [90, 90, 180, 120],
-        "รหัสกลุ่มสอบ": [
-            "GENED_ENG01",
-            "GENED_ENG01",
-            "",
-            "",
-        ],
-    }
-    df = pd.DataFrame(data)
-    buffer = io.BytesIO()
-    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="Exam_Subjects")
-    return buffer.getvalue()
+def reset_semester_data():
+    st.session_state["history_schedule"] = pd.DataFrame()
+    st.success("ล้างข้อมูลตารางสอบเดิมในระบบเรียบร้อยแล้ว! พร้อมสำหรับการจัดสอบเทอมใหม่")
 
 
-# ---5. วางฟังก์ชัน generate_excel_report()---
-import io
-import openpyxl  # <--- เพิ่ม import openpyxl
-from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
-import pandas as pd
-import streamlit as st
+# ==================== 2. ฟังก์ชันสร้างช่วงเวลาสอบ ====================
+def generate_time_slots(start_date, end_date, daily_slots):
+    """สร้างรายการวันและช่วงเวลาสอบทั้งหมดที่เป็นไปได้ (เว้นวันเสาร์-อาทิตย์)"""
+    slots = []
+    current_date = start_date
+    while current_date <= end_date:
+        if current_date.weekday() < 5:  # จันทร์ - ศุกร์
+            date_str = current_date.strftime("%d/%m/%Y")
+            for slot_name in daily_slots:
+                slots.append(f"{date_str} ({slot_name})")
+        current_date += datetime.timedelta(days=1)
+    return slots
 
-# ... (ส่วนตั้งค่า session_state และ USER_CREDENTIALS เดิมของคุณ) ...
+
+# ==================== 3. อัลกอริทึมจัดตารางสอบ (เช็คซ้อนกับรอบก่อนหน้า) ====================
+def auto_schedule_exams(
+    df_subjects,
+    df_rooms,
+    slots_m,
+    slots_f,
+    existing_schedule=None,
+    shuffle_invigilators=False,
+    avoid_own_dept=True,
+):
+    """
+    จัดตารางสอบโดยตรวจสอบเงื่อนไขไม่ให้เกิดข้อผิดพลาด:
+    - ดึงตารางสอบรอบก่อนหน้า (existing_schedule) มาจองพื้นที่ล่วงหน้าเพื่อไม่ให้ซ้อน
+    1. ห้ามกลุ่มนักศึกษาซ้อนเวลากัน
+    2. ห้ามใช้ห้องสอบซ้อนกัน และความจุต้องพอ
+    3. ห้ามอาจารย์คุมสอบติดภาระงานซ้อนกัน
+    """
+    student_group_occupancy = {}  # {slot: set(กลุ่มเรียน)}
+    room_occupancy = {}  # {slot: set(รหัสห้อง)}
+    invigilator_occupancy = {}  # {slot: set(ชื่อผู้คุมสอบ)}
+
+    # --- โหลดข้อมูลสอบเดิมเข้าระบบ (ถ้ามี) เพื่อป้องกันการจัดซ้อน ---
+    if existing_schedule is not None and not existing_schedule.empty:
+        for _, ex_row in existing_schedule.iterrows():
+            grp = str(ex_row.get("กลุ่มเรียน", "")).strip()
+
+            # สกัด Slot และ ห้องสอบ กลางภาค
+            m_info = str(ex_row.get("วันเวลาสอบ_M", ""))
+            if m_info and " [ห้อง " in m_info:
+                m_slot = m_info.split(" [ห้อง ")[0].strip()
+                m_rm = m_info.split(" [ห้อง ")[1].replace("]", "").strip()
+                m_inv = str(ex_row.get("ผู้คุมสอบ_M", "")).strip()
+
+                student_group_occupancy.setdefault(m_slot, set()).add(grp)
+                if m_rm:
+                    room_occupancy.setdefault(m_slot, set()).add(m_rm)
+                if m_inv:
+                    invigilator_occupancy.setdefault(m_slot, set()).add(m_inv)
+
+            # สกัด Slot และ ห้องสอบ ปลายภาค
+            f_info = str(ex_row.get("วันเวลาสอบ_F", ""))
+            if f_info and " [ห้อง " in f_info:
+                f_slot = f_info.split(" [ห้อง ")[0].strip()
+                f_rm = f_info.split(" [ห้อง ")[1].replace("]", "").strip()
+                f_inv = str(ex_row.get("ผู้คุมสอบ_F", "")).strip()
+
+                student_group_occupancy.setdefault(f_slot, set()).add(grp)
+                if f_rm:
+                    room_occupancy.setdefault(f_slot, set()).add(f_rm)
+                if f_inv:
+                    invigilator_occupancy.setdefault(f_slot, set()).add(f_inv)
+
+    all_teachers = list(df_subjects["ชื่อผู้สอน"].dropna().unique())
+    results = []
+
+    for idx, row in df_subjects.iterrows():
+        subj_code = row.get("รหัสวิชา", f"SUBJ-{idx}")
+        subj_name = row.get("ชื่อวิชา", "")
+        instructor = row.get("ชื่อผู้สอน", "อาจารย์ผู้สอน")
+        faculty = row.get("คณะ", row.get("สังกัดคณะ", "คณะเทคโนโลยีอุตสาหกรรมการเกษตร"))
+        dept = row.get("สังกัดสาขา", "")
+        group = str(row.get("กลุ่มเรียน", "")).strip()
+        students_count = int(row.get("จำนวนผู้เข้าสอบ", 0))
+        exam_type = row.get("ประเภทการสอบ", "ทฤษฎี")
+
+        valid_rooms = df_rooms[
+            (df_rooms["ความจุสอบ"] >= students_count)
+            & (df_rooms["สถานะ"] == "ใช้งานได้")
+        ]
+        if exam_type == "ปฏิบัติคอมพิวเตอร์":
+            valid_rooms = valid_rooms[
+                valid_rooms["ประเภท"] == "ห้องปฏิบัติการคอมพิวเตอร์"
+            ]
+
+        def get_available_invigilator(slot):
+            used_teachers = invigilator_occupancy.get(slot, set())
+            if not shuffle_invigilators:
+                return (
+                    instructor if instructor not in used_teachers else None
+                )
+
+            for t in all_teachers:
+                if t not in used_teachers:
+                    if avoid_own_dept and len(all_teachers) > 1:
+                        if t != instructor:
+                            return t
+                    else:
+                        return t
+            return None
+
+        # --- จัดสอบกลางภาค (Midterm - M) ---
+        m_slot_selected = ""
+        m_room_selected = ""
+        m_invigilator = ""
+
+        hrs_m = row.get("ชั่วโมงสอบ_M", row.get("ชั่วโมงสอบ (นาที)", 90))
+        if pd.notna(hrs_m) and str(hrs_m).strip() != "" and float(hrs_m) > 0:
+            for slot in slots_m:
+                if group in student_group_occupancy.get(slot, set()):
+                    continue
+
+                invig = get_available_invigilator(slot)
+                if not invig:
+                    continue
+
+                used_rooms = room_occupancy.get(slot, set())
+                avail_room = None
+                for _, r in valid_rooms.iterrows():
+                    if r["รหัสห้อง"] not in used_rooms:
+                        avail_room = r["รหัสห้อง"]
+                        break
+
+                if avail_room:
+                    m_slot_selected = slot
+                    m_room_selected = avail_room
+                    m_invigilator = invig
+
+                    student_group_occupancy.setdefault(slot, set()).add(group)
+                    invigilator_occupancy.setdefault(slot, set()).add(invig)
+                    room_occupancy.setdefault(slot, set()).add(avail_room)
+                    break
+
+        # --- จัดสอบปลายภาค (Final - F) ---
+        f_slot_selected = ""
+        f_room_selected = ""
+        f_invigilator = ""
+
+        hrs_f = row.get("ชั่วโมงสอบ_F", row.get("ชั่วโมงสอบ (นาที)", 120))
+        if pd.notna(hrs_f) and str(hrs_f).strip() != "" and float(hrs_f) > 0:
+            for slot in slots_f:
+                if group in student_group_occupancy.get(slot, set()):
+                    continue
+
+                invig = get_available_invigilator(slot)
+                if not invig:
+                    continue
+
+                used_rooms = room_occupancy.get(slot, set())
+                avail_room = None
+                for _, r in valid_rooms.iterrows():
+                    if r["รหัสห้อง"] not in used_rooms:
+                        avail_room = r["รหัสห้อง"]
+                        break
+
+                if avail_room:
+                    f_slot_selected = slot
+                    f_room_selected = avail_room
+                    f_invigilator = invig
+
+                    student_group_occupancy.setdefault(slot, set()).add(group)
+                    invigilator_occupancy.setdefault(slot, set()).add(invig)
+                    room_occupancy.setdefault(slot, set()).add(avail_room)
+                    break
+
+        # ปรับการแสดงผลชั่วโมงสอบ
+        val_hrs_m = float(hrs_m)/60 if float(hrs_m) > 10 else float(hrs_m) if hrs_m else ""
+        val_hrs_f = float(hrs_f)/60 if float(hrs_f) > 10 else float(hrs_f) if hrs_f else 2
+
+        results.append({
+            "คณะ": faculty,
+            "รหัสวิชา": subj_code,
+            "ชื่อวิชา": subj_name,
+            "ชื่อผู้สอน": instructor,
+            "สังกัดสาขา": dept,
+            "กลุ่มเรียน": group,
+            "จำนวนผู้เข้าสอบ": students_count,
+            "ชั่วโมงสอบ_M": val_hrs_m if m_slot_selected else "",
+            "ชั่วโมงสอบ_F": val_hrs_f if f_slot_selected else "",
+            "วันเวลาสอบ_M": (
+                f"{m_slot_selected} [ห้อง {m_room_selected}]"
+                if m_slot_selected
+                else "ไม่มีสอบ"
+            ),
+            "วันเวลาสอบ_F": (
+                f"{f_slot_selected} [ห้อง {f_room_selected}]"
+                if f_slot_selected
+                else "ไม่มีสอบ"
+            ),
+            "ผู้คุมสอบ_M": m_invigilator,
+            "ผู้คุมสอบ_F": f_invigilator,
+        })
+
+    return pd.DataFrame(results)
 
 
-# ➕ เพิ่มฟังก์ชันนี้เข้าไปใน app.py (วางไว้ช่วงต้นไฟล์)
-def generate_excel_report(df_schedule):
+# ==================== 4. ฟังก์ชันสร้างไฟล์ Excel (แยกหลายคณะตามจริง) ====================
+def generate_excel_report(df_schedule, title_m, title_f):
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "รายวิชาที่จัดสอบในตารางMF"
@@ -119,19 +266,18 @@ def generate_excel_report(df_schedule):
         left=thin_side, right=thin_side, top=thin_side, bottom=thin_side
     )
 
+    # หัวเรื่องใหญ่
     ws.merge_cells("A1:K1")
     ws["A1"] = "รายวิชาที่สอบในตาราง 1/2569"
     ws["A1"].font = font_title
     ws["A1"].alignment = align_center
 
     ws.merge_cells("A2:K2")
-    ws["A2"] = (
-        "สอบกลางภาค 24-28 สิงหาคม 2569 และ สอบปลายภาค 26 ตุลาคม - 1 พฤศจิกายน"
-        " 2569"
-    )
+    ws["A2"] = f"สอบกลางภาค {title_m} และ สอบปลายภาค {title_f}"
     ws["A2"].font = font_subtitle
     ws["A2"].alignment = align_center
 
+    # หัวคอลัมน์
     headers = [
         ("A3", "ที่"),
         ("B3", "รหัสวิชา"),
@@ -156,98 +302,81 @@ def generate_excel_report(df_schedule):
         )
         cell.border = border_all
 
-    ws.merge_cells("A4:K4")
-    ws["A4"] = "คณะเทคโนโลยีอุตสาหกรรมการเกษตร (M=14 , F=14)"
-    ws["A4"].font = font_faculty
-    ws["A4"].alignment = align_center
-    ws["A4"].fill = PatternFill(
-        start_color=FACULTY_BG, end_color=FACULTY_BG, fill_type="solid"
-    )
-    for col in range(1, 12):
-        ws.cell(row=4, column=col).border = border_all
+    current_row = 4
+    global_item_no = 1
 
-    start_row = 5
-    for idx, row in df_schedule.iterrows():
-        r_m = start_row
-        r_f = start_row + 1
+    # กลุ่มข้อมูลตามคณะที่มีจริงใน DataFrame
+    faculties = df_schedule["คณะ"].unique() if "คณะ" in df_schedule.columns else ["คณะเทคโนโลยีอุตสาหกรรมการเกษตร"]
 
-        for col_idx in [1, 2, 3, 4, 6, 7, 10, 11]:
-            ws.merge_cells(
-                start_row=r_m,
-                end_row=r_f,
-                start_column=col_idx,
-                end_column=col_idx,
-            )
+    for fac in faculties:
+        df_fac = df_schedule[df_schedule["คณะ"] == fac]
+        
+        # นับจำนวนวิชาที่จัดสอบ M และ F ของคณะนั้นๆ
+        m_count = len(df_fac[df_fac["วันเวลาสอบ_M"] != "ไม่มีสอบ"])
+        f_count = len(df_fac[df_fac["วันเวลาสอบ_F"] != "ไม่มีสอบ"])
 
-        ws.cell(row=r_m, column=1, value=idx + 1).alignment = align_center
-        ws.cell(row=r_m, column=2, value=row.get("รหัสวิชา", "")).alignment = (
-            align_center
-        )
-        ws.cell(row=r_m, column=3, value=row.get("ชื่อวิชา", "")).alignment = (
-            align_left
-        )
-        ws.cell(
-            row=r_m, column=4, value=row.get("ชื่อผู้สอน", "")
-        ).alignment = align_center
-        ws.cell(
-            row=r_m, column=7, value=row.get("จำนวนผู้เข้าสอบ", "")
-        ).alignment = align_center
+        # หัวข้อคณะ (สีกระทิง/ส้มอ่อน ตามแบบ)
+        ws.merge_cells(start_row=current_row, start_column=1, end_row=current_row, end_column=11)
+        fac_cell = ws.cell(row=current_row, column=1)
+        fac_cell.value = f"{fac} (M={m_count} , F={f_count})"
+        fac_cell.font = font_faculty
+        fac_cell.alignment = align_center
+        fac_cell.fill = PatternFill(start_color=FACULTY_BG, end_color=FACULTY_BG, fill_type="solid")
+        
+        for c in range(1, 12):
+            ws.cell(row=current_row, column=c).border = border_all
+        
+        current_row += 1
 
-        ws.cell(
-            row=r_m, column=10, value=row.get("วันเวลาสอบ", "")
-        ).alignment = align_center
-        ws.cell(
-            row=r_m, column=11, value=row.get("ผู้คุมสอบ", "")
-        ).alignment = align_center
+        # แสดงรายการวิชาในคณะนั้น
+        for idx, row in df_fac.iterrows():
+            r_m = current_row
+            r_f = current_row + 1
 
-        ws.cell(row=r_m, column=8, value="M").font = font_green_m
-        ws.cell(row=r_m, column=8).alignment = align_center
-        ws.cell(row=r_f, column=8, value="F").font = font_red_f
-        ws.cell(row=r_f, column=8).alignment = align_center
+            for col_idx in [1, 2, 3, 4, 6, 7]:
+                ws.merge_cells(start_row=r_m, end_row=r_f, start_column=col_idx, end_column=col_idx)
 
-        hrs_m = row.get("ชั่วโมงสอบ_M", "")
-        hrs_f = row.get("ชั่วโมงสอบ_F", 2)
+            ws.cell(row=r_m, column=1, value=global_item_no).alignment = align_center
+            ws.cell(row=r_m, column=2, value=row.get("รหัสวิชา", "")).alignment = align_center
+            ws.cell(row=r_m, column=3, value=row.get("ชื่อวิชา", "")).alignment = align_left
+            ws.cell(row=r_m, column=4, value=row.get("ชื่อผู้สอน", "")).alignment = align_center
+            ws.cell(row=r_m, column=6, value=row.get("กลุ่มเรียน", "")).alignment = align_center
+            ws.cell(row=r_m, column=7, value=row.get("จำนวนผู้เข้าสอบ", "")).alignment = align_center
 
-        ws.cell(row=r_m, column=9, value=hrs_m).alignment = align_center
-        ws.cell(row=r_f, column=9, value=hrs_f).alignment = align_center
+            # M Row
+            ws.cell(row=r_m, column=8, value="M").font = font_green_m
+            ws.cell(row=r_m, column=8).alignment = align_center
+            hrs_m = row.get("ชั่วโมงสอบ_M", "")
+            ws.cell(row=r_m, column=9, value=hrs_m).alignment = align_center
+            ws.cell(row=r_m, column=10, value=row.get("วันเวลาสอบ_M", "")).alignment = align_center
+            ws.cell(row=r_m, column=11, value=row.get("ผู้คุมสอบ_M", "")).alignment = align_center
 
-        if not hrs_m:
-            ws.cell(row=r_m, column=9).fill = PatternFill(
-                start_color=GRAY_FILL, end_color=GRAY_FILL, fill_type="solid"
-            )
+            if not hrs_m or hrs_m == "":
+                ws.cell(row=r_m, column=9).fill = PatternFill(start_color=GRAY_FILL, end_color=GRAY_FILL, fill_type="solid")
 
-        for r in [r_m, r_f]:
-            for c in range(1, 12):
-                cell = ws.cell(row=r, column=c)
-                cell.border = border_all
-                if not cell.font or cell.font.name != "TH SarabunPSK":
-                    cell.font = font_data
+            # F Row
+            ws.cell(row=r_f, column=8, value="F").font = font_red_f
+            ws.cell(row=r_f, column=8).alignment = align_center
+            hrs_f = row.get("ชั่วโมงสอบ_F", "")
+            ws.cell(row=r_f, column=9, value=hrs_f).alignment = align_center
+            ws.cell(row=r_f, column=10, value=row.get("วันเวลาสอบ_F", "")).alignment = align_center
+            ws.cell(row=r_f, column=11, value=row.get("ผู้คุมสอบ_F", "")).alignment = align_center
 
-        start_row += 2
+            if not hrs_f or hrs_f == "":
+                ws.cell(row=r_f, column=9).fill = PatternFill(start_color=GRAY_FILL, end_color=GRAY_FILL, fill_type="solid")
 
-    for tab_name in [
-        "เครื่องกล",
-        "FIB",
-        "ประมง",
-        "เทคโนเกษตร",
-        "ผลิตสัตว์",
-        "พืช",
-    ]:
-        wb.create_sheet(title=tab_name)
+            for r in [r_m, r_f]:
+                for c in range(1, 12):
+                    cell = ws.cell(row=r, column=c)
+                    cell.border = border_all
+                    if not cell.font or cell.font.name != "TH SarabunPSK":
+                        cell.font = font_data
 
-    col_widths = {
-        "A": 5,
-        "B": 12,
-        "C": 28,
-        "D": 18,
-        "E": 14,
-        "F": 8,
-        "G": 6,
-        "H": 6,
-        "I": 8,
-        "J": 25,
-        "K": 20,
-    }
+            global_item_no += 1
+            current_row += 2
+
+    # ปรับขนาดคอลัมน์
+    col_widths = {"A": 5, "B": 12, "C": 28, "D": 18, "E": 14, "F": 10, "G": 6, "H": 6, "I": 8, "J": 32, "K": 20}
     for col_letter, width in col_widths.items():
         ws.column_dimensions[col_letter].width = width
 
@@ -256,25 +385,56 @@ def generate_excel_report(df_schedule):
     return buffer.getvalue()
 
 
-# ==================== หน้าจอ 1: ล็อกอิน (Login Screen) ====================
+def create_dummy_subject_excel():
+    data = {
+        "คณะ": [
+            "คณะเทคโนโลยีอุตสาหกรรมการเกษตร",
+            "คณะเทคโนโลยีอุตสาหกรรมการเกษตร",
+            "คณะเทคโนโลยีสังคม",
+            "คณะเทคโนโลยีสังคม",
+        ],
+        "รหัสวิชา": ["05-110-104", "05-110-104", "02-303-101", "02-303-102"],
+        "ชื่อวิชา": [
+            "ภาษาอังกฤษทั่วไป",
+            "ภาษาอังกฤษทั่วไป",
+            "การวิเคราะห์และออกแบบระบบ",
+            "การเขียนโปรแกรมคอมพิวเตอร์",
+        ],
+        "กลุ่มเรียน": ["IS-261", "BA-21", "IS-261", "IT-11"],
+        "จำนวนผู้เข้าสอบ": [35, 38, 35, 40],
+        "ชื่อผู้สอน": [
+            "อ.มาริสา คงดี",
+            "อ.สมชาย ใจดี",
+            "ดร.สมชาย ใจดี",
+            "อ.สมศรี รักเรียน",
+        ],
+        "สังกัดสาขา": [
+            "ภาษาศาสตร์",
+            "ภาษาศาสตร์",
+            "เทคโนโลยีสารสนเทศ",
+            "เทคโนโลยีสารสนเทศ",
+        ],
+        "ประเภทการสอบ": ["ทฤษฎี", "ทฤษฎี", "ทฤษฎี", "ปฏิบัติคอมพิวเตอร์"],
+        "ชั่วโมงสอบ_M": [1.5, 1.5, 2, 2],
+        "ชั่วโมงสอบ_F": [2, 2, 3, 2],
+    }
+    df = pd.DataFrame(data)
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Exam_Subjects")
+    return buffer.getvalue()
+
+
+# ==================== 5. หน้าจอหลักและการทำงาน (Main App UI) ====================
 if not st.session_state["logged_in"]:
     col1, col2, col3 = st.columns([1, 2, 1])
     with col2:
         st.markdown("<br><br>", unsafe_allow_html=True)
-        st.image(
-            "https://www.rmutto.ac.th/wp-content/uploads/2019/11/logo_rmutto.png",
-            width=120,
-        )
         st.title("ระบบจัดตารางสอบอัตโนมัติ")
         st.subheader("งานส่งเสริมวิชาการและงานทะเบียน วิทยาเขตจันทบุรี")
-        st.write("กรุณาลงชื่อเข้าใช้งานด้วยรหัสที่ได้รับการอนุมัติจากแอดมินหลัก")
 
-        username_input = st.text_input(
-            "ชื่อผู้ใช้งาน (Username)", placeholder="กรอกชื่อผู้ใช้"
-        )
-        password_input = st.text_input(
-            "รหัสผ่าน (Password)", type="password", placeholder="กรอกรหัสผ่าน"
-        )
+        username_input = st.text_input("ชื่อผู้ใช้งาน (Username)")
+        password_input = st.text_input("รหัสผ่าน (Password)", type="password")
 
         if st.button("เข้าสู่ระบบ 🔐", use_container_width=True):
             if (
@@ -283,12 +443,10 @@ if not st.session_state["logged_in"]:
             ):
                 st.session_state["logged_in"] = True
                 st.session_state["username"] = username_input
-                st.success("เข้าสู่ระบบสำเร็จ!")
                 st.rerun()
             else:
                 st.error("ชื่อผู้ใช้งานหรือรหัสผ่านไม่ถูกต้อง")
 
-# ==================== หน้าจอ 2: หน้าหลักการทำงาน (Main App) ====================
 else:
     header_col1, header_col2 = st.columns([8, 2])
     with header_col1:
@@ -301,157 +459,111 @@ else:
 
     st.markdown("---")
 
-    # แถบเมนูด้านข้าง
+    # --- SideBar ---
     st.sidebar.header("เมนูการใช้งาน")
     menu_selection = st.sidebar.radio(
         "เลือกฟังก์ชันที่ต้องการทำงาน:",
         [
-            "1. จัดตารางสอบ (ผู้สอนคุมสอบอัตโนมัติ)",
-            "2. จัดตารางสอบ (คละผู้คุมสอบ)",
-            "3. จัดการข้อมูลห้องสอบ",
+            "1. จัดตารางสอบ (สะสมในระบบ)",
+            "2. จัดการข้อมูลห้องสอบ",
         ],
     )
 
     st.sidebar.markdown("---")
+    st.sidebar.header("🗓️ กำหนดช่วงเวลาสอบประจำเทอม")
 
-    # ปุ่มดาวน์โหลดไฟล์แม่แบบใน Sidebar
-    st.sidebar.subheader("📥 ดาวน์โหลดแบบฟอร์ม")
-    excel_template = create_dummy_subject_excel()
+    st.sidebar.subheader("1. สอบกลางภาค (Midterm)")
+    m_start = st.sidebar.date_input("วันเริ่มสอบกลางภาค", datetime.date(2026, 8, 24))
+    m_end = st.sidebar.date_input("วันสิ้นสุดสอบกลางภาค", datetime.date(2026, 8, 28))
+
+    st.sidebar.subheader("2. สอบปลายภาค (Final)")
+    f_start = st.sidebar.date_input("วันเริ่มสอบปลายภาค", datetime.date(2026, 10, 26))
+    f_end = st.sidebar.date_input("วันสิ้นสุดสอบปลายภาค", datetime.date(2026, 11, 1))
+
+    daily_slots = ["09:00 - 11:00", "11:00 - 13:00", "13:30 - 15:30", "15:30 - 17:30"]
+
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("⚙️ จัดการข้อมูลสะสม")
+    if st.sidebar.button("🔴 ล้างข้อมูลตารางสอบเดิม (เริ่มเทอมใหม่)", use_container_width=True):
+        reset_semester_data()
+
     st.sidebar.download_button(
         label="ดาวน์โหลดไฟล์ตัวอย่างวิชาสอบ (.xlsx)",
-        data=excel_template,
+        data=create_dummy_subject_excel(),
         file_name="exam_subjects_template.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
-    # ---------------- เมนูที่ 1: จัดตารางสอบ (ผู้สอนคุมสอบ) ----------------
-    if menu_selection == "1. จัดตารางสอบ (ผู้สอนคุมสอบอัตโนมัติ)":
-        st.header("🗓️ จัดตารางสอบอัตโนมัติ (อาจารย์ผู้สอนคุมสอบ)")
-        st.write(
-            "อัปโหลดไฟล์วิชาสอบ เพื่อให้ระบบจัดวัน เวลา และห้องสอบ โดยให้ผู้สอนคุมสอบเอง"
-        )
+    # ฐานข้อมูลห้องสอบ (Mock Data)
+    df_rooms = pd.DataFrame([
+        {"อาคาร": "อาคารเรียนรวม 36 ปี", "รหัสห้อง": "36-301", "ความจุสอบ": 40, "ประเภท": "ห้องทฤษฎี", "สถานะ": "ใช้งานได้"},
+        {"อาคาร": "อาคารเรียนรวม 36 ปี", "รหัสห้อง": "36-302", "ความจุสอบ": 40, "ประเภท": "ห้องทฤษฎี", "สถานะ": "ใช้งานได้"},
+        {"อาคาร": "อาคารปฏิบัติการไอที", "รหัสห้อง": "IT-201", "ความจุสอบ": 35, "ประเภท": "ห้องปฏิบัติการคอมพิวเตอร์", "สถานะ": "ใช้งานได้"},
+    ])
+
+    # ---------------- เมนูที่ 1: จัดตารางสอบ ----------------
+    if menu_selection == "1. จัดตารางสอบ (สะสมในระบบ)":
+        st.header("🗓️ จัดตารางสอบอัตโนมัติ (รองรับหลายคณะ & เพิ่มเติมวิชาสอบ)")
+        
+        # แสดงสถานะตารางสอบเดิมที่มีในระบบ
+        history_df = st.session_state["history_schedule"]
+        if not history_df.empty:
+            st.info(f"💡 **ขณะนี้มีวิชาที่จัดสอบไปแล้วในเทอมนี้จำนวน {len(history_df)} รายวิชา** (การจัดสอบเพิ่มเติมรอบนี้จะเช็คไม่ให้เวลา/ห้อง/อาจารย์ ชนกับ {len(history_df)} วิชาเดิม)")
+            with st.expander("🔍 ดูรายการตารางสอบเดิมที่มีในระบบ"):
+                st.dataframe(history_df)
+        else:
+            st.write("📌 ยังไม่มีตารางสอบสะสมในเทอมนี้ (เป็นการจัดสอบรอบแรก)")
 
         uploaded_file = st.file_uploader(
-            "เลือกไฟล์ข้อมูลวิชาสอบ (.xlsx)", type=["xlsx"]
+            "เลือกไฟล์ข้อมูลวิชาสอบที่ต้องการเพิ่ม/จัดสอบ (.xlsx)", type=["xlsx"], key="main_uploader"
         )
 
+        shuffle_invig = st.checkbox("ต้องการคละอาจารย์ผู้คุมสอบ (ถ้าไม่ติ๊ก ระบบจะให้อาจารย์ผู้สอนเป็นผู้คุมสอบ)", value=False)
+
         if uploaded_file is not None:
-            df = pd.read_excel(uploaded_file)
-            st.write("📋 **ตัวอย่างข้อมูลที่นำเข้า:**")
-            st.dataframe(df.head(5))
+            df_uploaded = pd.read_excel(uploaded_file)
+            st.write("📋 **รายการวิชาสอบใหม่ที่นำเข้า:**")
+            st.dataframe(df_uploaded)
 
-            # ตรวจสอบคอลัมน์สำคัญ
-            required_cols = [
-                "รหัสวิชา",
-                "ชื่อวิชา",
-                "ชั่วโมงสอบ (นาที)",
-                "รหัสกลุ่มสอบ",
-            ]
-            if all(col in df.columns for col in required_cols):
-                st.success("✅ โครงสร้างไฟล์ถูกต้อง รองรับชั่วโมงสอบและวิชาเรียนรวม")
+            if st.button("เริ่มประมวลผลจัดตารางสอบ ⚡", type="primary"):
+                with st.spinner("กำลังคำนวณและตรวจสอบเงื่อนไขเวลา..."):
+                    slots_m = generate_time_slots(m_start, m_end, daily_slots)
+                    slots_f = generate_time_slots(f_start, f_end, daily_slots)
 
-                if st.button("เริ่มประมวลผลจัดตารางสอบ ⚡", type="primary"):
-                    with st.spinner("กำลังคำนวณและจัดสรรช่วงเวลา..."):
-                        # [ประมวลผลตรรกะเวลาและรหัสกลุ่มสอบ]
-                        gened_count = df[
-                            df["รหัสกลุ่มสอบ"].notna()
-                            & (df["รหัสกลุ่มสอบ"] != "")
-                        ]["รหัสกลุ่มสอบ"].nunique()
-
-                   # --- แก้ไขเป็นแบบนี้ ---
-                    st.balloons()
-                    st.success(
-                        f"จัดตารางสอบสำเร็จ! รวมทั้งหมด {len(df)} รายการ (พบวิชาเรียนรวม"
-                        f" {gened_count} กลุ่มสอบ)"
+                    # คำนวณตารางสอบวิชาใหม่ โดยส่งตารางสอบเดิมไปเช็คชน
+                    df_new_result = auto_schedule_exams(
+                        df_uploaded,
+                        df_rooms,
+                        slots_m,
+                        slots_f,
+                        existing_schedule=history_df,
+                        shuffle_invigilators=shuffle_invig,
                     )
 
-                    # 1. เรียกใช้ฟังก์ชันแปลงข้อมูลเป็น Excel แบบใหม่
-                    excel_result = generate_excel_report(df)
+                    # รวมผลลัพธ์วิชาใหม่เข้ากับประวัติเดิม
+                    updated_schedule = pd.concat([history_df, df_new_result], ignore_index=True)
+                    st.session_state["history_schedule"] = updated_schedule
 
-                    # 2. เปลี่ยนสวิตช์ปุ่มให้กดดาวน์โหลดไฟล์ได้จริง
-                    st.download_button(
-                        label="ดาวน์โหลดผลลัพธ์ตารางสอบ (Excel) 📥",
-                        data=excel_result,
-                        file_name="ตารางสอบ_1_2569_MF.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    )
-            else:
-                st.error(
-                    f"⚠️ ไฟล์ขาดคอลัมน์สำคัญ กรุณาตรวจสอบว่ามีคอลัมน์: {', '.join(required_cols)}"
+                st.balloons()
+                st.success(f"✅ จัดตารางสอบสำเร็จ! เพิ่มวิชาสอบใหม่เรียบร้อยแล้ว (รวมทั้งหมดในเทอมนี้ {len(updated_schedule)} รายวิชา)")
+                
+                st.subheader("📊 ตารางสอบรวมทั้งหมดในระบบปัจจุบัน")
+                st.dataframe(updated_schedule)
+
+                str_m = f"{m_start.strftime('%d/%m/%Y')} - {m_end.strftime('%d/%m/%Y')}"
+                str_f = f"{f_start.strftime('%d/%m/%Y')} - {f_end.strftime('%d/%m/%Y')}"
+                excel_data = generate_excel_report(updated_schedule, str_m, str_f)
+
+                st.download_button(
+                    label="ดาวน์โหลดตารางสอบรวม Excel (รูปแบบ MF) 📥",
+                    data=excel_data,
+                    file_name="ตารางสอบรวม_1_2569_MF.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 )
 
-    # ---------------- เมนูที่ 2: จัดตารางสอบ (คละผู้คุมสอบ) ----------------
-    elif menu_selection == "2. จัดตารางสอบ (คละผู้คุมสอบ)":
-        st.header("🔀 จัดตารางสอบอัตโนมัติ (คละอาจารย์คุมสอบ)")
-        st.write(
-            "ระบบจะสลับคละอาจารย์ผู้คุมสอบ โดยกระจายภาระงานและไม่ให้อาจารย์ติดสอนหรือคุมสอบชนกัน"
-        )
-
-        uploaded_file = st.file_uploader(
-            "เลือกไฟล์ข้อมูลวิชาสอบ (.xlsx)", type=["xlsx"], key="menu2_file"
-        )
-
-        st.subheader("⚙️ ตั้งค่าเงื่อนไขการคละ")
-        col_c1, col_c2 = st.columns(2)
-        with col_c1:
-            avoid_own_dept = st.checkbox(
-                "หลีกเลี่ยงให้อาจารย์คุมสอบสาขาตัวเอง", value=True
-            )
-        with col_c2:
-            max_duty = st.number_input(
-                "ภาระงานคุมสอบสูงสุดต่อคน (ชั่วโมง)",
-                min_value=1,
-                max_value=20,
-                value=6,
-            )
-
-        if uploaded_file is not None:
-            if st.button("เริ่มประมวลผลคละผู้คุมสอบ 🔀", type="primary"):
-                st.info("ระบบกำลังประมวลผลกระจายคาบสอบตามเงื่อนไข...")
-                st.success("✅ คละผู้คุมสอบสำเร็จ! กระจายภาระงานเท่าเทียมกันเรียบร้อย")
-
-    # ---------------- เมนูที่ 3: จัดการข้อมูลห้องสอบ ----------------
-    elif menu_selection == "3. จัดการข้อมูลห้องสอบ":
+    # ---------------- เมนูที่ 2: จัดการข้อมูลห้องสอบ ----------------
+    elif menu_selection == "2. จัดการข้อมูลห้องสอบ":
         st.header("🏫 จัดการข้อมูลห้องสอบ")
-        st.write("ตรวจสอบและอัปเดตสถานะความพร้อมของห้องสอบในวิทยาเขต")
+        st.table(df_rooms)
 
-        mock_rooms = [
-            {
-                "อาคาร": "อาคารเรียนรวม 36 ปี",
-                "รหัสห้อง": "36-301",
-                "ความจุสอบ": 40,
-                "ประเภท": "ห้องทฤษฎี",
-                "สถานะ": "ใช้งานได้",
-            },
-            {
-                "อาคาร": "อาคารเรียนรวม 36 ปี",
-                "รหัสห้อง": "36-302",
-                "ความจุสอบ": 40,
-                "ประเภท": "ห้องทฤษฎี",
-                "สถานะ": "งดใช้งานชั่วคราว",
-            },
-            {
-                "อาคาร": "อาคารปฏิบัติการไอที",
-                "รหัสห้อง": "IT-201",
-                "ความจุสอบ": 35,
-                "ประเภท": "ห้องปฏิบัติการคอมพิวเตอร์",
-                "สถานะ": "ใช้งานได้",
-            },
-        ]
-
-        with st.expander("➕ เพิ่มห้องสอบใหม่เข้าสู่ระบบ"):
-            col_in1, col_in2 = st.columns(2)
-            with col_in1:
-                st.text_input("ชื่ออาคาร")
-                st.text_input("รหัสห้อง (เช่น 36-301)")
-            with col_in2:
-                st.number_input("ความจุสอบ (คน)", min_value=1, value=30)
-                st.selectbox(
-                    "ประเภทห้อง", ["ห้องทฤษฎี", "ห้องปฏิบัติการคอมพิวเตอร์"]
-                )
-
-            if st.button("บันทึกห้องสอบใหม่"):
-                st.success("บันทึกข้อมูลเรียบร้อยแล้ว!")
-
-        st.subheader("📋 รายการห้องสอบในระบบปัจจุบัน")
-        st.table(mock_rooms)
+    
